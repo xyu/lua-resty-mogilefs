@@ -1,3 +1,4 @@
+local http = require "resty.http"
 
 local _M = {
     _VERSION = '0.0.1'
@@ -13,6 +14,7 @@ function _M.new(self)
 
     return setmetatable({
         sock = sock,
+        http = http.new(),
     }, mt)
 end
 
@@ -36,8 +38,11 @@ local function _mog_request(sock, action, opts)
         return nil, 'TCP: not initialized'
     end
 
-    opts:set(action, true)
-    local bytes, err = sock:send(ngx.encode_args(opts) .. "\r\n")
+    local bytes, err = sock:send(string.format(
+        "%s&%s\n",
+        action,
+        ngx.encode_args(opts)
+    ))
     if not bytes then
         return nil, 'TCP: ' .. err
     end
@@ -56,7 +61,7 @@ local function _mog_request(sock, action, opts)
     end
 
     -- Just eat any errors, this is best effort only
-    local payload, err = ngx.decode_args(words[2], 0)
+    local payload, err = ngx.decode_args((words[2] or ''), 0)
 
     return {
         status = words[1],
@@ -69,38 +74,33 @@ end
 --
 
 function _M.connect(self, ...)
-    local sock = self.sock
-    if not sock then
+    if not self.sock then
         return nil, 'TCP: not initialized'
     end
 
-    local ok, err = sock:connect(...)
+    local ok, err = self.sock:connect(...)
     if not ok then
         return nil, 'TCP: ' .. err
     end
+
     return ok
 end
 
-function _M.set_timeout(self, ...)
-    local sock = self.sock
-    if not sock then
+function _M.set_timeouts(self, ...)
+    if not self.sock then
         return nil, 'TCP: not initialized'
     end
 
-    local ok, err = sock:settimeout(...)
-    if not ok then
-        return nil, 'TCP: ' .. err
-    end
-    return ok
+    self.sock:settimeouts(...)
+    return 1
 end
 
 function _M.set_keepalive(self, ...)
-    local sock = self.sock
-    if not sock then
+    if not self.sock then
         return nil, 'TCP: not initialized'
     end
 
-    local ok, err = sock:setkeepalive(...)
+    local ok, err = self.sock:setkeepalive(...)
     if not ok then
         return nil, 'TCP: ' .. err
     end
@@ -108,12 +108,11 @@ function _M.set_keepalive(self, ...)
 end
 
 function _M.get_reused_times(self)
-    local sock = self.sock
-    if not sock then
+    if not self.sock then
         return nil, 'TCP: not initialized'
     end
 
-    local count, err = sock:getreusedtimes()
+    local count, err = self.sock:getreusedtimes()
     if not count then
         return nil, 'TCP: ' .. err
     end
@@ -121,12 +120,11 @@ function _M.get_reused_times(self)
 end
 
 function _M.close(self)
-    local sock = self.sock
-    if not sock then
+    if not self.sock then
         return nil, 'TCP: not initialized'
     end
 
-    local ok, err = sock:close()
+    local ok, err = self.sock:close()
     if not ok then
         return nil, 'TCP: ' .. err
     end
@@ -161,9 +159,11 @@ function _M.get(self, domain, key, tries)
     for i = 1, tries, 1
     do
         if res.payload['path' .. i] then
-            stored = ngx.location.capture(res.payload['path' .. i])
-            if stored.status == ngx.HTTP_OK then
+            local stored, err = self.http:request_uri(res.payload['path' .. i])
+            if stored and stored.status == ngx.HTTP_OK then
                 return stored
+            else
+                return nil, err
             end
         end
     end
@@ -201,50 +201,41 @@ function _M.put(self, domain, key, payload)
         domain = domain,
         key = key,
         fid = 0,            -- auto generate a new fid
-        multi_dest = 1,     -- get multiple devices to upload to
+        multi_dest = 0,     -- TODO: maybe upload to multiple devices in future
     })
     if not res_open then
         return nil, err
     end
 
-    -- Upload file in parallel to all backends
-    local reqs = {}
-    for i = 1, res_open.payload['dev_count'], 1
-    do
-        if not res_open.payload['path_' .. i] then
-            break
-        end
-        table.insert(reqs, {
-            res_open.payload['path_' .. i],
-            {
-                method = ngx.HTTP_POST,
-                body = payload,
-            }
+    -- Upload file to stored backend
+    local payload_size = string.len(payload)
+    local stored, err = self.http:request_uri(
+        res_open.payload['path'],
+        {
+            method = 'PUT',
+            body = payload,
+            headers = {
+                ["Content-Type"] = "application/x-www-form-urlencoded",
+                ["Content-Length"] = payload_size,
+            },
+        }
+    )
+    if not stored then
+        return nil, err
+    end
+
+    if stored.status == ngx.HTTP_CREATED then
+        return _mog_request(self.sock, 'CREATE_CLOSE', {
+            domain = domain,
+            key = key,
+            size = payload_size,
+            fid = res_open.payload['fid'],
+            devid = res_open.payload['devid'],
+            path = res_open.payload['path'],
         })
     end
-    local storeds = {ngx.location.capture_multi(reqs)}
 
-    -- Check stored status, finalize any that are successful and consider this
-    -- entire call successful if atleast one backend stored the file.
-    local putok = nil; size = string.len(payload)
-    for i = 1, table.getn(storeds), 1
-    do
-        if storeds[i].status == ngx.HTTP_OK then
-            local res_close, err = _mog_request(self.sock, 'CREATE_CLOSE', {
-                domain = domain,
-                key = key,
-                size = size,
-                fid = res_open.payload['fid'],
-                devid = res_open.payload['devid_' .. i],
-                path = res_open.payload['path_' .. i],
-            })
-            if res_close then
-                putok = res_close
-            end
-        end
-    end
-
-    return putok
+    return nil, 'MOG: failed to upload to backend'
 end
 
 return _M
